@@ -15,16 +15,24 @@
 import json
 import os
 import subprocess
+import shutil
 import sys
+import re
+import tempfile
 
 import click
 
-from SCons.Script import ARGUMENTS, COMMAND_LINE_TARGETS
+from SCons.Script import ARGUMENTS, Builder, COMMAND_LINE_TARGETS
 
 from platformio import fs
 from platformio.compat import WINDOWS
 from platformio.proc import exec_command
 from platformio.util import get_systype
+from platformio.package import version
+from platformio.package.vcsclient import GitClient
+from platformio.package.manager.tool import ToolPackageManager
+from platformio.package.meta import PackageSpec
+
 
 Import("env")
 
@@ -70,13 +78,32 @@ PLATFORMS_WITH_EXTERNAL_HAL = {
     "nordicnrf52": ["st", "nordic"],
     "nxplpc": ["st", "nxp"],
     "nxpimxrt": ["st", "nxp"],
+    "teensy": ["st", "nxp"],
+    "raspberrypi": ["rpi_pico"]
 }
+
+
+# By default Zephyr modules are cloned without submodules. Temporarily subclass
+# the default PlatformIO Git client to override the clone command
+class NonRecursiveGitClient(GitClient):
+    def export(self):
+        is_commit = self.is_commit_id(self.tag)
+        args = ["clone"]
+        if not self.tag or not is_commit:
+            args += ["--depth", "1"]
+            if self.tag:
+                args += ["--branch", self.tag]
+        args += [self.remote_url, self.src_dir]
+        assert self.run_cmd(args, cwd=os.getcwd())
+        if is_commit:
+            assert self.run_cmd(["reset", "--hard", self.tag])
+        return True
 
 
 def get_board_architecture(board_config):
     if board_config.get("build.cpu", "").lower().startswith("cortex"):
         return "arm"
-    elif board_config.get("build.march", "") in ("rv64imac", "rv32imac"):
+    elif board_config.get("build.march", "").startswith(("rv64", "rv32")):
         return "riscv"
     elif board_config.get("build.mcu") == "esp32":
         return "xtensa32"
@@ -92,9 +119,24 @@ def populate_zephyr_env_vars(zephyr_env, board_config):
     toolchain_variant = "UNKNOWN"
     arch = get_board_architecture(board_config)
     if arch == "arm":
-        toolchain_variant = "gnuarmemb"
-        zephyr_env["GNUARMEMB_TOOLCHAIN_PATH"] = platform.get_package_dir(
-            "toolchain-gccarmnoneeabi"
+        toolchain_variant = "zephyr"
+        zephyr_env["ZEPHYR_SDK_INSTALL_DIR"] = "C:\\Users\\Max\\Downloads\\zephyr-sdk-0.14.2_windows-x86_64_minimal\\zephyr-sdk-0.14.2" 
+        #= platform.get_package_dir(
+        #    "toolchain-gccarmnoneeabi"
+        #)
+        env.Replace(
+            AR="arm-zephyr-eabi-ar",
+            AS="arm-zephyr-eabi-as",
+            CC="arm-zephyr-eabi-gcc",
+            CXX="arm-zephyr-eabi-g++",
+            GDB="arm-zephyr-eabi-gdb",
+            OBJCOPY="arm-zephyr-eabi-objcopy",
+            RANLIB="arm-zephyr-eabi-ranlib",
+            SIZETOOL="arm-zephyr-eabi-size",
+        )
+        env.PrependENVPath(
+            "PATH",
+            "C:\\Users\\Max\\Downloads\\zephyr-sdk-0.14.2_windows-x86_64_minimal\\zephyr-sdk-0.14.2\\arm-zephyr-eabi\\bin"
         )
     elif arch == "riscv":
         toolchain_variant = "cross-compile"
@@ -126,8 +168,8 @@ def is_proper_zephyr_project():
 
 
 def create_default_project_files():
-    cmake_tpl = """cmake_minimum_required(VERSION 3.13.1)
-include($ENV{ZEPHYR_BASE}/cmake/app/boilerplate.cmake NO_POLICY_SCOPE)
+    cmake_tpl = """ccmake_minimum_required(VERSION 3.20.0)
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(%s)
 
 FILE(GLOB app_sources ../src/*.c*)
@@ -173,29 +215,19 @@ def is_cmake_reconfigure_required():
         zephyr_prj_conf
     ) > os.path.getmtime(cmake_cache_file):
         return True
+    if os.path.getmtime(FRAMEWORK_DIR) > os.path.getmtime(cmake_cache_file):
+        return True
 
     return False
 
 
-def get_zephyr_modules():
-    west_config = os.path.join(FRAMEWORK_DIR, "west.yml")
-    if not os.path.isfile(west_config):
-        sys.stderr.write("Error: Couldn't find 'west.yml'\n")
-        env.Exit(1)
-
-    with open(west_config) as fp:
-        config = list(yaml.load_all(fp, Loader=yaml.FullLoader))[0]
-        return [
-            m
-            for m in config["manifest"]["projects"]
-            if not m["path"].startswith(
-                ("tools", "modules/bsim_hw_models", "modules/hal")
-            )
-        ]
-
-
-def run_cmake():
+def run_cmake(manifest):
     print("Reading CMake configuration...")
+
+    CONFIG_PATH = board.get(
+        "build.zephyr.config_path",
+        os.path.join(PROJECT_DIR, "config.%s" % env.subst("$PIOENV")),
+    )
 
     cmake_cmd = [
         os.path.join(platform.get_package_dir("tool-cmake") or "", "bin", "cmake"),
@@ -209,6 +241,7 @@ def run_cmake():
         "-DPYTHON_EXECUTABLE:FILEPATH=%s" % env.subst("$PYTHONEXE"),
         "-DPYTHON_PREFER:FILEPATH=%s" % env.subst("$PYTHONEXE"),
         "-DPIO_PACKAGES_DIR:PATH=%s" % env.subst("$PROJECT_PACKAGES_DIR"),
+        "-DDOTCONFIG=" + CONFIG_PATH,
     ]
 
     menuconfig_file = os.path.join(PROJECT_DIR, "zephyr", "menuconfig.conf")
@@ -221,34 +254,23 @@ def run_cmake():
             click.parser.split_arg_string(board.get("build.zephyr.cmake_extra_args"))
         )
 
-    zephyr_modules = []
-    for m in get_zephyr_modules():
-        module_name = "framework-zephyr-" + m["name"].replace("_", "-")
-        try:
-            module_path = platform.get_package_dir(module_name)
-        except KeyError:
-            print("Warning! Missing Zephyr module " + module_name)
-            continue
-        zephyr_modules.append(module_path)
+    modules = [generate_default_component()]
 
-    platform_name = env.subst("$PIOPLATFORM")
-    if platform_name in PLATFORMS_WITH_EXTERNAL_HAL:
-        zephyr_modules.extend(
-            [
-                platform.get_package_dir("framework-zephyr-hal-" + m)
-                for m in PLATFORMS_WITH_EXTERNAL_HAL[platform_name]
-            ]
+    for project in manifest.get("projects", []):
+        if not is_project_required(project):
+            continue
+
+        modules.append(
+            fs.to_unix_path(
+                os.path.join(
+                    FRAMEWORK_DIR,
+                    "_pio",
+                    project["path"] if "path" in project else project["name"],
+                )
+            )
         )
 
-    if get_board_architecture(board) == "arm":
-        zephyr_modules.append(platform.get_package_dir("framework-zephyr-cmsis"))
-
-    if zephyr_modules:
-        zephyr_modules = [
-            _fix_package_path(m) if "@" in os.path.basename(m) else m
-            for m in zephyr_modules
-        ]
-        cmake_cmd.extend(["-D", "ZEPHYR_MODULES=" + ";".join(zephyr_modules)])
+    cmake_cmd.extend(["-D", "ZEPHYR_MODULES=" + ";".join(modules)])
 
     # Run Zephyr in an isolated environment with specific env vars
     zephyr_env = os.environ.copy()
@@ -265,7 +287,7 @@ def run_cmake():
         print(result["err"])
 
 
-def get_cmake_code_model():
+def get_cmake_code_model(manifest):
     if not is_proper_zephyr_project():
         create_default_project_files()
 
@@ -277,7 +299,7 @@ def get_cmake_code_model():
         if not os.path.isfile(query_file):
             os.makedirs(os.path.dirname(query_file))
             open(query_file, "a").close()  # create an empty file
-        run_cmake()
+        run_cmake(manifest)
 
     if not os.path.isdir(CMAKE_API_REPLY_DIR) or not os.listdir(CMAKE_API_REPLY_DIR):
         sys.stderr.write("Error: Couldn't find CMake API response file\n")
@@ -302,7 +324,7 @@ def get_target_elf_arch(board_config):
     if architecture == "arm":
         return "elf32-littlearm"
     if architecture == "riscv":
-        if board.get("build.march", "") == "rv32imac":
+        if board.get("build.march", "") == "rv32":
             return "elf32-littleriscv"
         return "elf64-littleriscv"
     if architecture == "xtensa32":
@@ -345,7 +367,8 @@ def _fix_package_path(module_path):
     module_name = os.path.basename(module_path)
     if "@" in module_name:
         new_path = os.path.join(
-            os.path.dirname(module_path), module_name.replace("@", "-"),
+            os.path.dirname(module_path),
+            module_name.replace("@", "-"),
         )
         os.rename(module_path, new_path)
         module_path = new_path
@@ -421,6 +444,27 @@ def validate_driver():
     env.Execute(env.VerboseAction(" ".join(cmd), "Validating driver..."))
 
 
+def generate_dev_handles(preliminary_elf_path):
+    cmd = (
+        "$PYTHONEXE",
+        '"%s"' % os.path.join(FRAMEWORK_DIR, "scripts", "gen_handles.py"),
+        "--output-source",
+        "$TARGET",
+        "--kernel",
+        "$SOURCE",
+        "--start-symbol",
+        "__device_start",
+        "--zephyr-base",
+        FRAMEWORK_DIR,
+    )
+
+    return env.Command(
+        os.path.join("$BUILD_DIR", "zephyr", "dev_handles.c"),
+        preliminary_elf_path,
+        env.VerboseAction(" ".join(cmd), "Generating $TARGET"),
+    )
+
+
 def parse_syscalls():
     syscalls_config = os.path.join(
         "$BUILD_DIR", "zephyr", "misc", "generated", "syscalls.json"
@@ -487,7 +531,7 @@ def generate_syscall_files(syscalls_json, project_settings):
     env.Execute(env.VerboseAction(" ".join(cmd), "Generating syscall files"))
 
 
-def get_linkerscript_final_cmd(app_config, base_ld_script):
+def get_linkerscript_final_cmd(app_includes, base_ld_script):
     cmd = [
         "$CC",
         "-x",
@@ -502,6 +546,9 @@ def get_linkerscript_final_cmd(app_config, base_ld_script):
         "-DLINKER_PASS2",
         "-D_LINKER",
         "-D_ASMLANGUAGE",
+        "-imacros",
+        os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "autoconf.h"),
+        "-DLINKER_ZEPHYR_FINAL",
         "-E",
         "$SOURCE",
         "-P",
@@ -509,20 +556,18 @@ def get_linkerscript_final_cmd(app_config, base_ld_script):
         "$TARGET",
     ]
 
-    includes = extract_includes_from_compile_group(app_config["compileGroups"][0])
-    cmd.extend(['-I"%s"' % inc for inc in includes["plain_includes"]])
+    cmd.extend(['-I"%s"' % inc for inc in app_includes["plain_includes"]])
 
     return env.Command(
-        os.path.join("$BUILD_DIR", "zephyr", "linker_pass_final.cmd"),
+        os.path.join("$BUILD_DIR", "zephyr", "linker.cmd"),
         base_ld_script,
         env.VerboseAction(" ".join(cmd), "Generating final linker script $TARGET"),
     )
 
 
-def find_base_ldscript(app_config):
-    includes = extract_includes_from_compile_group(app_config["compileGroups"][0])
+def find_base_ldscript(app_includes):
     # A temporary solution since there is no easy way to find linker script
-    for inc in includes["plain_includes"]:
+    for inc in app_includes["plain_includes"]:
         for f in os.listdir(inc):
             if f == "linker.ld" and os.path.isfile(os.path.join(inc, f)):
                 return os.path.join(inc, f)
@@ -531,7 +576,7 @@ def find_base_ldscript(app_config):
     env.Exit(1)
 
 
-def get_linkerscript_cmd(app_config, base_ld_script):
+def get_linkerscript_cmd(app_includes, base_ld_script, pre_num):
     cmd = [
         "$CC",
         "-x",
@@ -545,6 +590,9 @@ def get_linkerscript_cmd(app_config, base_ld_script):
         "-D__GCC_LINKER_CMD__",
         "-D_LINKER",
         "-D_ASMLANGUAGE",
+        "-imacros",
+        os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "autoconf.h"),
+        "-DLINKER_DEVICE_HANDLES_PASS1" if pre_num == 0 else "-DLINKER_ZEPHYR_PREBUILT",
         "-E",
         "$SOURCE",
         "-P",
@@ -552,11 +600,10 @@ def get_linkerscript_cmd(app_config, base_ld_script):
         "$TARGET",
     ]
 
-    includes = extract_includes_from_compile_group(app_config["compileGroups"][0])
-    cmd.extend(['-I"%s"' % inc for inc in includes["plain_includes"]])
+    cmd.extend(['-I"%s"' % inc for inc in app_includes["plain_includes"]])
 
     return env.Command(
-        os.path.join("$BUILD_DIR", "zephyr", "linker.cmd"),
+        os.path.join("$BUILD_DIR", "zephyr", "linker_zephyr_pre%d.cmd" % pre_num),
         base_ld_script,
         env.VerboseAction(" ".join(cmd), "Generating linker script $TARGET"),
     )
@@ -590,10 +637,7 @@ def extract_defines_from_compile_group(compile_group):
 def prepare_build_envs(config, default_env):
     build_envs = []
     target_compile_groups = config.get("compileGroups", [])
-    is_build_type_debug = (
-        set(["debug", "sizedata"]) & set(COMMAND_LINE_TARGETS)
-        or default_env.GetProjectOption("build_type") == "debug"
-    )
+    is_build_type_debug = "debug" in env.GetBuildType()
 
     for cg in target_compile_groups:
         includes = extract_includes_from_compile_group(cg, path_prefix=FRAMEWORK_DIR)
@@ -670,13 +714,7 @@ def compile_source_files(config, default_env, project_src_dir, prepend_dir=None)
 
 
 def get_app_includes(app_config):
-    includes = extract_includes_from_compile_group(
-        app_config["compileGroups"][0], FRAMEWORK_DIR)
-    # Add path with pregenerated headers
-    includes["plain_includes"].append(
-        os.path.join(BUILD_DIR, "zephyr", "include", "generated")
-    )
-
+    includes = extract_includes_from_compile_group(app_config["compileGroups"][0])
     return includes
 
 
@@ -715,51 +753,50 @@ def get_app_defines(app_config):
     return extract_defines_from_compile_group(app_config["compileGroups"][0])
 
 
-def get_app_flags(app_config, default_env):
-    app_env = prepare_build_envs(app_config, default_env)[0]
-    return {
-        "ASFLAGS": app_env.get("ASFLAGS", []),
-        "CFLAGS": app_env.get("CFLAGS", []),
-        "CCFLAGS": app_env.get("CCFLAGS", []),
-        "CXXFLAGS": app_env.get("CXXFLAGS", []),
+def extract_link_args(target_config):
+    link_args = {
+        "link_flags": [],
+        "lib_paths": [],
+        "project_libs": {"whole_libs": [], "generic_libs": [], "standard_libs": []},
     }
 
-
-def extract_link_args(target_config):
-    link_args = {"LINKFLAGS": [], "LIBS": [], "LIBPATH": [], "__LIB_DEPS": []}
-
+    is_whole_archive = False
     for f in target_config.get("link", {}).get("commandFragments", []):
-        fragment = f.get("fragment", "").strip()
+        fragment = f.get("fragment", "").strip().replace("\\", "/")
         fragment_role = f.get("role", "").strip()
         if not fragment or not fragment_role:
             continue
         args = click.parser.split_arg_string(fragment)
+        if "-Wl,--whole-archive" in fragment:
+            is_whole_archive = True
+        if "-Wl,--no-whole-archive" in fragment:
+            is_whole_archive = False
         if fragment_role == "flags":
-            link_args["LINKFLAGS"].extend(args)
+            link_args["link_flags"].extend(args)
         elif fragment_role == "libraries":
-            if fragment.startswith("-l"):
-                link_args["LIBS"].extend(args)
+            if fragment.startswith(("-l", "-Wl,-l")):
+                link_args["project_libs"]["standard_libs"].extend(args)
             elif fragment.startswith("-L"):
                 lib_path = fragment.replace("-L", "").strip()
-                if lib_path not in link_args["LIBPATH"]:
-                    link_args["LIBPATH"].append(lib_path.replace('"', ""))
+                if lib_path not in link_args["lib_paths"]:
+                    link_args["lib_paths"].append(lib_path.replace('"', ""))
             elif fragment.startswith("-") and not fragment.startswith("-l"):
-                # CMake mistakenly marks LINKFLAGS as libraries
-                link_args["LINKFLAGS"].extend(args)
+                # CMake mistakenly marks link_flags as libraries
+                link_args["link_flags"].extend(args)
             elif os.path.isfile(fragment) and os.path.isabs(fragment):
                 # In case of precompiled archives from framework package
                 lib_path = os.path.dirname(fragment)
-                if lib_path not in link_args["LIBPATH"]:
-                    link_args["LIBPATH"].append(os.path.dirname(fragment))
-                link_args["LIBS"].extend(
-                    [os.path.basename(l) for l in args if l.endswith(".a")]
+                if lib_path not in link_args["lib_paths"]:
+                    link_args["lib_paths"].append(os.path.dirname(fragment))
+                link_args["project_libs"]["standard_libs"].extend(
+                    [os.path.basename(lib) for lib in args if lib.endswith(".a")]
                 )
             elif fragment.endswith(".a"):
-                link_args["__LIB_DEPS"].extend(
-                    [os.path.basename(l) for l in args if l.endswith(".a")]
-                )
+                link_args["project_libs"][
+                    "whole_libs" if is_whole_archive else "generic_libs"
+                ].extend([lib.replace("\\", "/") for lib in args if lib.endswith(".a")])
             else:
-                link_args["LINKFLAGS"].extend(args)
+                link_args["link_flags"].extend(args)
 
     return link_args
 
@@ -781,7 +818,7 @@ def generate_isr_list_binary(preliminary_elf, board):
     )
 
 
-def generate_isr_table_file_cmd(preliminary_elf, board_config):
+def generate_isr_table_file_cmd(preliminary_elf, board_config, project_settings):
     cmd = [
         "$PYTHONEXE",
         '"%s"' % os.path.join(FRAMEWORK_DIR, "arch", "common", "gen_isr_tables.py"),
@@ -793,15 +830,10 @@ def generate_isr_table_file_cmd(preliminary_elf, board_config):
         "${SOURCES[1]}",
     ]
 
-    config_file = os.path.join(BUILD_DIR, "zephyr", ".config")
-
-    if os.path.isfile(config_file):
-        with open(config_file) as fp:
-            data = fp.read()
-        if "CONFIG_GEN_ISR_TABLES=y" in data:
-            cmd.append("--sw-isr-table")
-        if "CONFIG_GEN_IRQ_VECTOR_TABLE=y" in data:
-            cmd.append("--vector-table")
+    if project_settings.get("CONFIG_GEN_ISR_TABLES", "") == "y":
+        cmd.append("--sw-isr-table")
+    if project_settings.get("CONFIG_GEN_IRQ_VECTOR_TABLE", "") == "y":
+        cmd.append("--vector-table")
 
     cmd = env.Command(
         os.path.join("$BUILD_DIR", "zephyr", "isr_tables.c"),
@@ -813,6 +845,23 @@ def generate_isr_table_file_cmd(preliminary_elf, board_config):
 
     return cmd
 
+def generate_version_header_file_cmd():
+    cmd = [
+        os.path.join(platform.get_package_dir("tool-cmake"), "bin", "cmake"),
+        "-DZEPHYR_BASE=%s" % FRAMEWORK_DIR,
+        "-DOUT_FILE='%s'" % os.path.join(
+            "$BUILD_DIR", "zephyr", "include", "generated", "version.h"),
+        "-DBUILD_VERSION=%s" % ("zephyr-v" + FRAMEWORK_VERSION.split(".")[1]),
+        "-P",
+        os.path.join(FRAMEWORK_DIR, "cmake", "gen_version_h.cmake")
+    ]
+
+    cmd = env.Command(
+        os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "version.h"),
+        [],
+        env.VerboseAction(" ".join(cmd), "Generating Version Header $TARGET"),
+    )
+    return cmd
 
 def generate_offset_header_file_cmd():
     cmd = [
@@ -862,17 +911,21 @@ def filter_args(args, allowed, ignore=None):
 
 def load_project_settings():
     result = {}
-    autoconf = os.path.join(BUILD_DIR, "zephyr", "include", "generated", "autoconf.h")
-    if not os.path.isfile(autoconf):
-        print("Warning! Cannot find autoconf file. Project settings won't be processed")
-        return result
-    with open(autoconf, "r") as fp:
-        for line in fp.readlines():
-            line = line.strip()
-            if line.startswith("#define"):
-                config = line.split(" ", 2)
-                assert len(config) != 2, config
-                result[config[1]] = config[2]
+    config_re = re.compile(r"^([^#=]+)=(.+)$")
+    config_file = os.path.join(BUILD_DIR, "zephyr", ".config")
+    if not os.path.isfile(config_file):
+        print("Warning! Missing project configuration file `%s`" % config_file)
+        return {}
+
+    with open(config_file) as f:
+        for line in f:
+            re_match = config_re.match(line)
+            if re_match:
+                config_value = re_match.group(2)
+                if config_value.startswith('"') and config_value.endswith('"'):
+                    config_value = config_value[1:-1]
+                result[re_match.group(1)] = config_value
+
     return result
 
 
@@ -895,6 +948,303 @@ def RunMenuconfig(target, source, env):
         sys.stderr.write("Error: Couldn't execute 'menuconfig' target.\n")
         env.Exit(1)
 
+
+def get_project_lib_deps(modules_map, main_config):
+    def _collect_lib_deps(config, libs=None):
+        libs = libs or {}
+        deps = config.get("dependencies", [])
+        if not deps:
+            return []
+
+        for d in config["dependencies"]:
+            dependency_id = d["id"]
+            if not modules_map.get(dependency_id, {}):
+                continue
+            if dependency_id not in libs:
+                libs[dependency_id] = modules_map[dependency_id]
+                _collect_lib_deps(libs[dependency_id]["config"], libs)
+
+        return libs
+
+    return _collect_lib_deps(main_config)
+
+
+def load_west_manifest(manifest_path):
+    if not os.path.isfile(manifest_path):
+        sys.stderr.write("Error: Couldn't find `%s`\n" % manifest_path)
+        env.Exit(1)
+
+    with open(manifest_path) as fp:
+        try:
+            return yaml.safe_load(fp).get("manifest", {})
+        except yaml.YAMLError as e:
+            sys.stderr.write("Warning! Failed to parse `%s`.\n" % manifest_path)
+            sys.stderr.write(str(e) + "\n")
+            env.Exit(1)
+
+
+def prepare_package_url(remotes, default_remote_name, package_config):
+    if "url" in package_config:
+        remote_url = package_config["url-base"]
+    else:
+        remote_url = remotes.get(default_remote_name, "").get("url-base", "")
+        if "remote" in package_config:
+            remote_url = remotes[package_config["remote"]]["url-base"]
+
+        remote_url = (
+            remote_url
+            + "/"
+            + (
+                package_config["repo-path"]
+                if "repo-path" in package_config
+                else package_config["name"]
+            )
+        )
+
+    return remote_url + ".git"
+
+
+def get_package_requirement(package_config):
+    package_revision = package_config["revision"]
+    # At least 10 symbols are required in commit hash
+    hash_re = re.compile(r"[0-9a-f]{10,40}")
+    if hash_re.match(package_revision):
+        return "0.0.0-alpha+sha.%s" % package_revision[:10]
+    elif package_revision.startswith("v") and "." in package_revision:
+        # Remove 'v' and try to get a valid semver version
+        try:
+            v = version.cast_version_to_semver(
+                package_revision[1:], raise_exception=True
+            )
+            return str(v)
+        except:
+            pass
+
+    return None
+
+
+def install_from_remote(package_config, dst_dir, remotes, default_remote):
+    remote_url = prepare_package_url(remotes, default_remote, package_config)
+    revision = package_config["revision"] if "revision" in package_config else "master"
+    if not env.WhereIs("git"):
+        print(
+            "Warning! Git client is not installed in your system! "
+            "Install Git client from https://git-scm.com/downloads and try again."
+        )
+        return
+
+    os.makedirs(dst_dir)
+    vcs = None
+    if package_config.get("submodules", False):
+        vcs = GitClient(fs.to_unix_path(dst_dir), remote_url, revision, True)
+    else:
+        vcs = NonRecursiveGitClient(
+            fs.to_unix_path(dst_dir), remote_url, revision, True
+        )
+    assert vcs.export()
+
+
+def install_from_registry(project_config, package_manager, package_path):
+    package_name = "framework-zephyr-%s" % project_config["name"].replace("_", "-")
+    package_requirement = get_package_requirement(project_config)
+    spec = PackageSpec(
+        owner="platformio",
+        name=package_name,
+        requirements=package_requirement,
+    )
+    try:
+        pkg = package_manager.install(spec, silent=True)
+        if os.path.isdir(pkg.path):
+            if not os.path.isdir(os.path.dirname(package_path)):
+                os.makedirs(os.path.dirname(package_path))
+            # Move the folder to proper location in the Zephyr package
+            shutil.move(pkg.path, package_path)
+            assert os.path.isdir(package_path)
+            return package_path
+    except Exception:
+        print(
+            "Couldn't install the `%s` package from PlatformIO Registry." % package_name
+        )
+
+    return None
+
+
+def process_bundled_packages(west_manifest):
+    if not west_manifest:
+        print("Warning! Empty package manifest!")
+
+    assert (
+        "projects" in west_manifest
+    ), "Missing the `projects` field in package manifest!"
+
+    # Create a folder for extra packages from west.yml
+    packages_root = os.path.join(FRAMEWORK_DIR, "_pio")
+    if not os.path.isdir(packages_root):
+        os.makedirs(packages_root)
+
+    # Remotes for external Zephyr packages if installed from repository
+    default_remote = west_manifest.get("defaults", {}).get("remote", "")
+    remotes = {remote["name"]: remote for remote in west_manifest["remotes"]}
+
+    with tempfile.TemporaryDirectory(prefix="_pio") as tmpdir:
+        # Built-in PlatformIO Package manager to download remote packages
+        pm = ToolPackageManager(tmpdir)
+        # Install missing packages
+        for project_config in west_manifest.get("projects", []):
+            if not is_project_required(project_config):
+                continue
+
+            project_name = project_config["name"]
+            package_path = os.path.join(
+                packages_root, project_config.get("path", project_name)
+            )
+            if not os.path.isdir(package_path):
+                if project_name == "trusted-firmware-m":
+                    # Support for this module is not implemented
+                    continue
+                print("Installing `%s` package..." % project_name)
+                if not install_from_registry(project_config, pm, package_path):
+                    install_from_remote(
+                        project_config, package_path, remotes, default_remote
+                    )
+
+
+def generate_default_component():
+    # Used to force CMake generate build environments for all supported languages
+
+    prj_cmake_tpl = """# Warning! Do not delete this auto-generated file.
+file(GLOB module_srcs *.c* *.S)
+add_library(_PIODUMMY INTERFACE)
+zephyr_library()
+zephyr_library_sources(${module_srcs})
+"""
+
+    module_cfg_tpl = """# Warning! Do not delete this auto-generated file.
+build:
+  cmake: .
+"""
+
+    dummy_component_path = os.path.join(FRAMEWORK_DIR, "_pio", "_bare_module")
+    if not os.path.isdir(dummy_component_path):
+        os.makedirs(dummy_component_path)
+
+    for ext in (".cpp", ".c", ".S"):
+        dummy_src_file = os.path.join(dummy_component_path, "__dummy" + ext)
+        if not os.path.isfile(dummy_src_file):
+            open(dummy_src_file, "a").close()
+
+    component_cmake = os.path.join(dummy_component_path, "CMakeLists.txt")
+    if not os.path.isfile(component_cmake):
+        with open(component_cmake, "w") as fp:
+            fp.write(prj_cmake_tpl)
+
+    zephyr_module_config = os.path.join(dummy_component_path, "zephyr", "module.yml")
+    if not os.path.isfile(zephyr_module_config):
+        if not os.path.isdir(zephyr_module_config):
+            os.makedirs(os.path.dirname(zephyr_module_config))
+        with open(zephyr_module_config, "w") as fp:
+            fp.write(module_cfg_tpl)
+
+    return dummy_component_path
+
+
+def get_default_build_flags(app_config, default_config):
+    assert default_config
+
+    def _extract_flags(config):
+        flags = {}
+        for cg in config.get("compileGroups", []):
+            flags[cg["language"]] = []
+            for ccfragment in cg["compileCommandFragments"]:
+                fragment = ccfragment.get("fragment", "")
+                if not fragment.strip() or fragment.startswith("-D"):
+                    continue
+                flags[cg["language"]].extend(
+                    click.parser.split_arg_string(fragment.strip())
+                )
+
+        return flags
+
+    app_flags = _extract_flags(app_config)
+    default_flags = _extract_flags(default_config)
+
+    return {
+        "ASFLAGS": app_flags.get("ASM", default_flags.get("ASM")),
+        "CFLAGS": app_flags.get("C", default_flags.get("C")),
+        "CXXFLAGS": app_flags.get("CXX", default_flags.get("CXX")),
+    }
+
+
+def is_project_required(project_config):
+    # Some packages are not
+    project_name = project_config["name"]
+    if project_name.startswith("hal_") and project_name[
+        4:
+    ] not in PLATFORMS_WITH_EXTERNAL_HAL.get(env.subst("$PIOPLATFORM"), []):
+        return False
+
+    if project_config["path"].startswith("tool") or project_name.startswith("nrf_hw_"):
+        return False
+
+    return True
+
+
+def get_default_module_config(target_configs):
+    for config in target_configs:
+        if "_pio___bare_module" in config:
+            return target_configs[config]
+    return {}
+
+
+def process_project_lib_deps(
+    modules_map, project_libs, preliminary_elf_path, preliminary_elf_path_1, offset_lib, lib_paths
+):
+    # Get rid of the `app` library as the project source files are handled by PlatformIO
+    # and linker as object files in the linker command
+    whole_libs = [
+        lib for lib in project_libs["whole_libs"] if "app.a" not in lib
+    ]
+
+    # Some of the project libraries should be linked entirely, so they are manually
+    # wrapped inside the `--whole-archive` and `--no-whole-archive` flags.
+    env.Append(
+        LIBPATH=lib_paths,
+        _LIBFLAGS=" -Wl,--whole-archive "
+        + " ".join(
+            [os.path.join("$BUILD_DIR", library) for library in whole_libs]
+            + [offsets_lib[0].get_abspath()]
+        )
+        + " -Wl,--no-whole-archive "
+        + " ".join(
+            [
+                os.path.join("$BUILD_DIR", library)
+                for library in project_libs["generic_libs"]
+            ]
+            + project_libs["standard_libs"]
+        ),
+    )
+
+    # Note: These libraries are not added to the `LIBS` section. Hence they must be
+    # specified as explicit dependencies.
+    env.Depends(
+        preliminary_elf_path,
+        [
+            os.path.join("$BUILD_DIR", library)
+            for library in project_libs["generic_libs"] + whole_libs
+            if "app" not in library and "dev_handles" not in library and "isrList" not in library
+        ],
+    )
+
+    env.Depends(
+        preliminary_elf_path_1,
+        [
+            os.path.join("$BUILD_DIR", library)
+            for library in project_libs["generic_libs"] + whole_libs
+            if "app" not in library
+        ],
+    )
+
+
 #
 # Current build script limitations
 #
@@ -906,10 +1256,17 @@ if " " in FRAMEWORK_DIR:
     env.Exit(1)
 
 #
+# Process Zephyr internal packages
+#
+
+west_manifest = load_west_manifest(os.path.join(FRAMEWORK_DIR, "west.yml"))
+process_bundled_packages(west_manifest)
+
+#
 # Initial targets loading
 #
 
-codemodel = get_cmake_code_model()
+codemodel = get_cmake_code_model(west_manifest)
 if not codemodel:
     sys.stderr.write("Error: Couldn't find code model generated by CMake\n")
     env.Exit(1)
@@ -917,10 +1274,13 @@ if not codemodel:
 target_configs = load_target_configurations(codemodel)
 
 app_config = target_configs.get("app")
-prebuilt_config = target_configs.get("zephyr_prebuilt")
+prebuilt_config_0 = target_configs.get("zephyr_pre0")
+prebuilt_config_1 = target_configs.get("zephyr_pre1")
 
-if not app_config or not prebuilt_config:
+if not app_config or not prebuilt_config_0:
     sys.stderr.write("Error: Couldn't find main Zephyr target in the code model\n")
+    sys.stderr.write("App config is there: %s\n" % (str(app_config is not None)))
+    sys.stderr.write("Prebuilt config is there: %s\n" % (str(prebuilt_config_0 is not None)))
     env.Exit(1)
 
 project_settings = load_project_settings()
@@ -930,7 +1290,7 @@ project_settings = load_project_settings()
 #
 
 offset_header_file = generate_offset_header_file_cmd()
-
+version_header_file = generate_version_header_file_cmd()
 syscalls_config = parse_syscalls()
 generate_syscall_files(syscalls_config, project_settings)
 generate_kobject_files()
@@ -941,12 +1301,14 @@ validate_driver()
 #
 
 app_includes = get_app_includes(app_config)
-base_ld_script = find_base_ldscript(app_config)
-final_ld_script = get_linkerscript_final_cmd(app_config, base_ld_script)
-preliminary_ld_script = get_linkerscript_cmd(app_config, base_ld_script)
+base_ld_script = find_base_ldscript(app_includes)
+final_ld_script = get_linkerscript_final_cmd(app_includes, base_ld_script)
+preliminary_ld_script = get_linkerscript_cmd(app_includes, base_ld_script, 0)
+preliminary_ld_script_1 = get_linkerscript_cmd(app_includes, base_ld_script, 1)
 
 env.Depends(final_ld_script, offset_header_file)
 env.Depends(preliminary_ld_script, offset_header_file)
+env.Depends(preliminary_ld_script_1, offset_header_file)
 
 #
 # Includible files processing
@@ -980,112 +1342,114 @@ env.Append(CPPDEFINES=[("BUILD_VERSION", "zephyr-v" + FRAMEWORK_VERSION.split(".
 framework_modules_map = {}
 for target, target_config in target_configs.items():
     lib_name = target_config["name"]
-    if target_config["type"] not in (
-        "STATIC_LIBRARY",
-        "OBJECT_LIBRARY",
-    ) or lib_name in ("app", "offsets"):
+    if (
+        target_config["type"]
+        not in (
+            "STATIC_LIBRARY",
+            "OBJECT_LIBRARY",
+        )
+        or lib_name in ("app", "offsets")
+    ):
         continue
 
     lib = build_library(env, target_config, PROJECT_SRC_DIR)
-    framework_modules_map[target_config["id"]] = lib
+    framework_modules_map[target_config["id"]] = {
+        "lib_path": lib[0],
+        "config": target_config,
+    }
 
     if any(
-        d.get("id", "").startswith(("zephyr_generated_headers"))
+        d.get("id", "").startswith("zephyr_generated_headers")
         for d in target_config.get("dependencies", [])
     ):
         env.Depends(lib[0].sources, offset_header_file)
 
-# Offsets library compiled separately as it used later for custom dependencies
+# Offsets library compiled separately as it's used later for custom dependencies
 offsets_lib = build_library(env, target_configs["offsets"], PROJECT_SRC_DIR)
 
 #
 # Preliminary elf and subsequent targets
 #
 
-preliminary_elf_path = os.path.join("$BUILD_DIR", "firmware-pre.elf")
+preliminary_elf_path = os.path.join("$BUILD_DIR", "zephyr", "firmware-pre0.elf")
+preliminary_elf_path_1 = os.path.join("$BUILD_DIR", "zephyr", "firmware-pre1.elf")
 
-for dep in (offsets_lib, preliminary_ld_script):
+for dep in (offsets_lib, preliminary_ld_script, preliminary_ld_script_1, version_header_file):
     env.Depends(preliminary_elf_path, dep)
 
-isr_table_file = generate_isr_table_file_cmd(preliminary_elf_path, board)
+isr_table_file = generate_isr_table_file_cmd(
+    preliminary_elf_path_1, board, project_settings
+)
+if project_settings.get("CONFIG_HAS_DTS", ""):
+    dev_handles = generate_dev_handles(preliminary_elf_path)
+
+#env.Depends(preliminary_elf_path_1, dev_handles)
 
 #
 # Final firmware targets
 #
 
 env.Append(
-    PIOBUILDFILES=compile_source_files(prebuilt_config, env, PROJECT_SRC_DIR),
-    _EXTRA_ZEPHYR_PIOBUILDFILES=compile_source_files(
-        target_configs["zephyr_final"], env, PROJECT_SRC_DIR
-    ),
-    __ZEPHYR_OFFSET_HEADER_CMD=offset_header_file
+    PIOBUILDFILES=[
+        compile_source_files(prebuilt_config_0, env, PROJECT_SRC_DIR),
+        compile_source_files(prebuilt_config_1, env, PROJECT_SRC_DIR)
+    ],
+    _EXTRA_ZEPHYR_PIOBUILDFILES=compile_source_files(target_configs["zephyr_final"], env, PROJECT_SRC_DIR),
+    __ZEPHYR_OFFSET_HEADER_CMD=offset_header_file,
 )
 
 for dep in (isr_table_file, final_ld_script):
     env.Depends("$PROG_PATH", dep)
 
-# Note: `app` is replaced by files from the `src` folder
-# `kernel`, `libopenthread` and `isr_tables` libs should be placed outside the
-# `whole-archive` flags
-ignore_libs = ("kernel", "isr_tables", "app", "openthread")
-
-whole_libs = []
-weak_libs = []
-for d in prebuilt_config.get("dependencies", []):
-    dependency_id = d["id"]
-    if not framework_modules_map.get(dependency_id, {}):
-        continue
-
-    fmodule = framework_modules_map[dependency_id]
-    if dependency_id.startswith(ignore_libs):
-        weak_libs.append(fmodule)
-    else:
-        whole_libs.append(fmodule)
-
-env.Replace(ARFLAGS=["qc"])
-env.Prepend(_LIBFLAGS="-Wl,--whole-archive ")
-
-project_config = app_config
-project_defines = get_app_defines(project_config)
-project_flags = get_app_flags(project_config, env)
-link_args = extract_link_args(prebuilt_config)
+linker_arguments = extract_link_args(prebuilt_config_0)
 
 # remove the main linker script flags '-T linker.cmd'
 try:
-    ld_index = link_args["LINKFLAGS"].index("linker.cmd")
-    link_args["LINKFLAGS"].pop(ld_index)
-    link_args["LINKFLAGS"].pop(ld_index - 1)
+    ld_index = linker_arguments["link_flags"].index("linker.cmd")
+    linker_arguments["link_flags"].pop(ld_index)
+    linker_arguments["link_flags"].pop(ld_index - 1)
 except:
-    print("Warning! Couldn't find the main linker script in the CMake code model.")
+    pass
+
+# Define bootloader SRAM to 0
+linker_arguments["link_flags"].insert(1, "-Wl,--defsym=CONFIG_BOOTLOADER_SRAM_SIZE=0")
 
 # Flags shouldn't be merged automatically as they have precise position in linker cmd
-ignore_flags = ("CMakeFiles", "-Wl,--whole-archive", "-Wl,--no-whole-archive")
-
-link_args["LINKFLAGS"] = sorted(
-    filter_args(link_args["LINKFLAGS"], ["-"], ignore_flags)
+ignore_flags = ("CMakeFiles", "-Wl,--whole-archive", "-Wl,--no-whole-archive", "-Wl,-T")
+linker_arguments["link_flags"] = filter_args(
+    linker_arguments["link_flags"], ["-"], ignore_flags
 )
 
-# Note: isr_tables, kernel, openthread and standard libraries must be placed explicitly
-# after zephyr libraries outside of whole-archive flag and specified as explicit
-# dependencies
+#
+# On this stage project libraries are placed in proper places inside the linker command
+#
 
-env.Depends(
-    preliminary_elf_path, [env.subst(library)[0] for library in weak_libs]
+process_project_lib_deps(
+    framework_modules_map,
+    linker_arguments["project_libs"],
+    preliminary_elf_path,
+    preliminary_elf_path_1,
+    offsets_lib,
+    linker_arguments["lib_paths"],
 )
 
+#
+# Here default build flags pulled from the `app` configuration
+#
+
+env.Replace(ARFLAGS=["qc"])
 env.Append(
     CPPPATH=app_includes["plain_includes"],
     CCFLAGS=[("-isystem", inc) for inc in app_includes.get("sys_includes", [])],
-    CPPDEFINES=project_defines,
-    LIBS=sorted(whole_libs) + [offsets_lib],
-    _LIBFLAGS=" -Wl,--no-whole-archive "
-    + " ".join([env.subst(library)[0] for library in weak_libs] + link_args["LIBS"]),
+    CPPDEFINES=get_app_defines(app_config),
+    LINKFLAGS=linker_arguments["link_flags"],
 )
 
-# Standard libraries in LIBS are already added to the LINKCOMMAND in _LIBFLAGS
-link_args["LIBS"] = []
-project_flags.update(link_args)
-env.MergeFlags(project_flags)
+build_flags = get_default_build_flags(
+    app_config, get_default_module_config(target_configs)
+)
+env.Append(**build_flags)
+
 
 #
 # Custom builders required
