@@ -119,24 +119,9 @@ def populate_zephyr_env_vars(zephyr_env, board_config):
     toolchain_variant = "UNKNOWN"
     arch = get_board_architecture(board_config)
     if arch == "arm":
-        toolchain_variant = "zephyr"
-        zephyr_env["ZEPHYR_SDK_INSTALL_DIR"] = "C:\\Users\\Max\\Downloads\\zephyr-sdk-0.14.2_windows-x86_64_minimal\\zephyr-sdk-0.14.2" 
-        #= platform.get_package_dir(
-        #    "toolchain-gccarmnoneeabi"
-        #)
-        env.Replace(
-            AR="arm-zephyr-eabi-ar",
-            AS="arm-zephyr-eabi-as",
-            CC="arm-zephyr-eabi-gcc",
-            CXX="arm-zephyr-eabi-g++",
-            GDB="arm-zephyr-eabi-gdb",
-            OBJCOPY="arm-zephyr-eabi-objcopy",
-            RANLIB="arm-zephyr-eabi-ranlib",
-            SIZETOOL="arm-zephyr-eabi-size",
-        )
-        env.PrependENVPath(
-            "PATH",
-            "C:\\Users\\Max\\Downloads\\zephyr-sdk-0.14.2_windows-x86_64_minimal\\zephyr-sdk-0.14.2\\arm-zephyr-eabi\\bin"
+        toolchain_variant = "gnuarmemb"
+        zephyr_env["GNUARMEMB_TOOLCHAIN_PATH"] = platform.get_package_dir(
+            "toolchain-gccarmnoneeabi"
         )
     elif arch == "riscv":
         toolchain_variant = "cross-compile"
