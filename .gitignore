@@ -61,3 +61,6 @@ TAGS
 tags
 
 .idea
+
+# Platformio
+_pio/
