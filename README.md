@@ -9,8 +9,11 @@ There are some tweeks to build a stm32 board in with Platformio
  - create new zephyr project with PlatformIO
  - append in plaformio.ini ```
 platform_packages =
-    framework-zephyr @ file:///run/media/kappy/d/programms/zephyr/zephyrPioBackup/framework-zephyr ```
-
+    framework-zephyr @ https://github.com/Hygdrasil/platformIO_zephyr3.git ```
+ - build the project
+  PlatformIO should download this repo. 
+  It will clone the other dependencies in a subdirectory. 
+  This process may take a while.
 # Further TODOS
 
 - Test other Platforms than stm32
