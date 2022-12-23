@@ -46,9 +46,10 @@ def ZephyrBuildProgram(env):
     # Force execution of offset header target before compiling project sources
     env.Depends(env["PIOBUILDFILES"], env["__ZEPHYR_OFFSET_HEADER_CMD"])
 
+    main_file_path = list(filter(lambda f: "main.c" in f,  os.listdir(env["PROJECT_SRC_DIR"])))[0]
     program = env.Program(
         os.path.join("$BUILD_DIR", env.subst("$PROGNAME")),
-        #env["PIOBUILDFILES"][1] + 
+        [os.path.join(env["PROJECT_SRC_DIR"], main_file_path)] +
         env["_EXTRA_ZEPHYR_PIOBUILDFILES"],
         LDSCRIPT_PATH=os.path.join("$BUILD_DIR", "zephyr", "linker.cmd")
     )
@@ -65,6 +66,9 @@ def ZephyrBuildProgram(env):
             env.VerboseAction(env.CheckUploadSize, "Checking size $PIOMAINPROG"),
         )
     )
+    
+    #TODO find out where CPPPATH is realy missing in this script
+    env.Append( CPPPATH=[lib.path for lib in  env["__PIO_LIB_BUILDERS"]])
 
     print("Building in %s mode" % env.GetBuildType())
 
