@@ -53,7 +53,6 @@ except ImportError:
 
     import yaml
 
-
 platform = env.PioPlatform()
 board = env.BoardConfig()
 
@@ -79,7 +78,8 @@ PLATFORMS_WITH_EXTERNAL_HAL = {
     "nxplpc": ["st", "nxp"],
     "nxpimxrt": ["st", "nxp"],
     "teensy": ["st", "nxp"],
-    "raspberrypi": ["rpi_pico"]
+    "raspberrypi": ["rpi_pico"],
+    "espressif32": ["xtensa", "espressif"]
 }
 
 
@@ -107,6 +107,7 @@ def get_board_architecture(board_config):
         return "riscv"
     elif board_config.get("build.mcu") == "esp32":
         return "xtensa32"
+    
 
     sys.stderr.write(
         "Error: Cannot configure Zephyr environment for %s\n"
@@ -133,7 +134,9 @@ def populate_zephyr_env_vars(zephyr_env, board_config):
         zephyr_env["ESPRESSIF_TOOLCHAIN_PATH"] = platform.get_package_dir(
             "toolchain-xtensa32"
         )
-
+        #custom hook to generate a path of  ESPRESSIF_TOOLCHAIN_PATH/bin/ESPRESSIF_TOOLCHAIN_BIN_PATH
+        # for the cross compiler
+        zephyr_env["ESPRESSIF_TOOLCHAIN_BIN_PATH"] = "xtensa-esp32-elf"
     zephyr_env["ZEPHYR_TOOLCHAIN_VARIANT"] = toolchain_variant
     zephyr_env["ZEPHYR_BASE"] = FRAMEWORK_DIR
 
@@ -477,18 +480,20 @@ def validate_driver():
 
 
 def generate_dev_handles(preliminary_elf_path):
-    cmd = (
+    cmd = ("echo"
         "$PYTHONEXE",
         '"%s"' % os.path.join(FRAMEWORK_DIR, "scripts", "build", "gen_handles.py"),
         "--output-source",
         "$TARGET",
         "--kernel",
-        "$SOURCE",
+        "$SOURCE",#'/run/media/kappy/d/programms/zephyr/testproject/zephyr/build/zephyr/zephyr_pre0.elf'
         "--start-symbol",
         "__device_start",
         "--zephyr-base",
         FRAMEWORK_DIR,
     )
+    #kernel='/run/media/kappy/d/programms/zephyr/testproject/zephyr/build/zephyr/zephyr_pre0.elf', num_dynamic_devices=0, output_source='dev_handles.c', verbose=False, zephyr_base='/run/media/kappy/d/programms/zephyr/testproject/zephyr', start_symbol='__device_start')
+
 
     return env.Command(
         os.path.join("$BUILD_DIR", "zephyr", "dev_handles.c"),
@@ -913,6 +918,7 @@ def generate_sterror_table():
         "$TARGET",
     ]
 
+<<<<<<< HEAD
     builder = env.Command(
         os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "libc", "minimal", "strerror_table.h"),
         [],
@@ -945,13 +951,60 @@ def generate_offset_header_file_cmd():
             "CMakeFiles",
             "offsets.dir",
             "arch",
-            get_board_architecture(board),
+            "xtensa",#get_board_architecture(board),
             "core",
             "offsets",
             "offsets.c.o"),
         env.VerboseAction(" ".join(cmd), "Generating header file with offsets $TARGET"),
     )
+    env.Requires(builder, generate_zsr_header_file_cmd())
     return builder
+
+def pre_generate_zsr_header_file_cmd():
+    device_name = board.manifest["build"]["zephyr"]["variant"]
+    cmd = [
+        f'{platform.get_package_dir("toolchain-xtensa32")}/bin/xtensa-esp32-elf-gcc',
+        "-E", "-dM", "-U__XCC__",
+        #f'-I{FRAMEWORK_DIR}/_pio/modules/hal/xtensa/zephyr/soc/{device_name}',
+        f'-I{FRAMEWORK_DIR}/soc/xtensa/{device_name}',
+        f'-I{FRAMEWORK_DIR}_pio/modules/hal/espressif/components/xtensa/esp32/include/xtensa/config/core-isa.h',
+        os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "core-isa-dM.c"),
+        "-o", os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "core-isa-dM.h")
+    ]
+
+    cmd = env.Command(
+        os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "core-isa-dM.h"),
+        [],
+        env.VerboseAction(" ".join(cmd), "Pre_Generating ZSR Header $TARGET"),
+    )
+    return cmd
+
+def generate_zsr_header_file_cmd():
+    
+    device_name = board.manifest["build"]["zephyr"]["variant"]
+    output_file = os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "zsr.h")
+    cmd = [
+        f'{platform.get_package_dir("toolchain-xtensa32")}/bin/xtensa-esp32-elf-gcc',
+        "-E", "-dM", "-U__XCC__",
+        #f'-I{FRAMEWORK_DIR}/_pio/modules/hal/xtensa/zephyr/soc/{device_name}',
+        f'-I{FRAMEWORK_DIR}/soc/xtensa/{device_name}',
+        f'-I{FRAMEWORK_DIR}_pio/modules/hal/espressif/components/xtensa/esp32/include/xtensa/config/core-isa.h',
+        os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "core-isa-dM.c"),
+        "-o", os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "core-isa-dM.h"),
+        "&&",
+        "$PYTHONEXE",
+        '"%s"' % os.path.join(FRAMEWORK_DIR, "arch", "xtensa", "core", "gen_zsr.py"),
+        os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "core-isa-dM.h"),
+        output_file
+        
+    ]
+
+    cmd = env.Command(
+        output_file,
+        [],
+        env.VerboseAction(" ".join(cmd), "Generating ZSR Header $TARGET")
+    )
+    return cmd
 
 
 def filter_args(args, allowed, ignore=None):
@@ -1086,7 +1139,6 @@ def get_package_requirement(package_config):
             pass
 
     return None
-
 
 def install_from_remote(package_config, dst_dir, remotes, default_remote):
     remote_url = prepare_package_url(remotes, default_remote, package_config)
@@ -1308,7 +1360,6 @@ def process_project_lib_deps(
             if "app" not in library
         ],
     )
-
 #
 # Current build script limitations
 #
@@ -1354,6 +1405,8 @@ project_settings = load_project_settings()
 #
 
 offset_header_file = generate_offset_header_file_cmd()
+#pre_zsr_header_file = pre_generate_zsr_header_file_cmd()
+#zsr_header_file = generate_zsr_header_file_cmd()
 version_header_file = generate_version_header_file_cmd()
 syscalls_config = parse_syscalls()
 
@@ -1377,9 +1430,9 @@ final_ld_script = get_linkerscript_final_cmd(app_includes, base_ld_script)
 preliminary_ld_script = get_linkerscript_cmd(app_includes, base_ld_script, 0)
 preliminary_ld_script_1 = get_linkerscript_cmd(app_includes, base_ld_script, 1)
 
-env.Depends(final_ld_script, offset_header_file)
 env.Depends(preliminary_ld_script, offset_header_file)
 env.Depends(preliminary_ld_script_1, offset_header_file)
+env.Depends(final_ld_script, offset_header_file)
 
 #
 # Includible files processing
@@ -1396,13 +1449,14 @@ if (
     )
 
 if "build.embed_files" in board:
+    print("embedding files")
+    raise Exception()
     for f in board.get("build.embed_files", "").split():
         file = os.path.join(PROJECT_DIR, f)
         if not os.path.isfile(env.subst(f)):
             print('Warning! Could not find file "%s"' % os.path.basename(f))
             continue
-
-        env.Depends(offset_header_file, generate_includible_file(file))
+        env.Depends(pre_zsr_header_file, generate_includible_file(file))
 
 #
 # Libraries processing
@@ -1435,7 +1489,11 @@ for target, target_config in target_configs.items():
     ):
         env.Depends(lib[0].sources, offset_header_file)
 
+
 sterror_table = generate_sterror_table()
+
+# Offsets library compiled separately as it's used later for custom dependencies
+offsets_lib = build_library(env, target_configs["offsets"], PROJECT_SRC_DIR)
 #
 # Preliminary elf and subsequent targets
 #
@@ -1449,22 +1507,22 @@ for dep in (offset_obj, preliminary_ld_script, preliminary_ld_script_1, version_
 isr_table_file = generate_isr_table_file_cmd(
     preliminary_elf_path_1, board, project_settings
 )
+
 if project_settings.get("CONFIG_HAS_DTS", ""):
     dev_handles = generate_dev_handles(preliminary_elf_path)
-
-#env.Depends(preliminary_elf_path_1, dev_handles)
 
 #
 # Final firmware targets
 #
+env.Depends(preliminary_ld_script, dev_handles)
 
 env.Append(
     PIOBUILDFILES=[
         compile_source_files(prebuilt_config_0, env, PROJECT_SRC_DIR),
-        compile_source_files(prebuilt_config_1, env, PROJECT_SRC_DIR)
+        compile_source_files(prebuilt_config_1, env, PROJECT_SRC_DIR),
     ],
     _EXTRA_ZEPHYR_PIOBUILDFILES=compile_source_files(target_configs["zephyr_final"], env, PROJECT_SRC_DIR),
-    __ZEPHYR_OFFSET_HEADER_CMD=offset_header_file
+    __ZEPHYR_OFFSET_HEADER_CMD=offset_header_file,
 )
 
 for dep in (isr_table_file, final_ld_script):

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 zephyr_get(ESPRESSIF_TOOLCHAIN_PATH)
+set_ifndef(ESPRESSIF_TOOLCHAIN_PATH "$ENV{ESPRESSIF_TOOLCHAIN_PATH}"  CACHE PATH "")
 assert(    ESPRESSIF_TOOLCHAIN_PATH "ESPRESSIF_TOOLCHAIN_PATH is not set")
-
 set(TOOLCHAIN_HOME ${ESPRESSIF_TOOLCHAIN_PATH})
 
 set(COMPILER gcc)
@@ -33,12 +33,18 @@ if(toolchain_paths)
 
   get_filename_component(one_toolchain_root "${some_toolchain_path}" DIRECTORY)
   get_filename_component(one_toolchain "${some_toolchain_path}" NAME)
-
   set(CROSS_COMPILE_TARGET ${one_toolchain})
   set(SYSROOT_TARGET	   ${one_toolchain})
 
   if(ESPRESSIF_DEPRECATED_PATH)
-    set(CROSS_COMPILE ${ESPRESSIF_TOOLCHAIN_PATH}/bin/${CROSS_COMPILE_TARGET}-)
+    if(DEFINED ENV{ESPRESSIF_TOOLCHAIN_BIN_PATH})
+      set_ifndef(ESPRESSIF_TOOLCHAIN_BIN_PATH $ENV{ESPRESSIF_TOOLCHAIN_BIN_PATH})
+    else()
+      message("fuck")
+      set_ifndef(ESPRESSIF_TOOLCHAIN_BIN_PATH ${CROSS_COMPILE_TARGET})
+    endif()
+    message(ESPRESSIF_TOOLCHAIN_BIN_PATH="${ESPRESSIF_TOOLCHAIN_BIN_PATH}")
+    set(CROSS_COMPILE ${ESPRESSIF_TOOLCHAIN_PATH}/bin/${ESPRESSIF_TOOLCHAIN_BIN_PATH}-)
     set(SYSROOT_DIR   ${ESPRESSIF_TOOLCHAIN_PATH}/${SYSROOT_TARGET})
   else()
     set(CROSS_COMPILE ${one_toolchain_root}/bin/${CROSS_COMPILE_TARGET}-)
@@ -54,3 +60,4 @@ if(NOT CROSS_COMPILE_TARGET)
 endif()
 
 set(TOOLCHAIN_HAS_NEWLIB ON CACHE BOOL "True if toolchain supports newlib")
+

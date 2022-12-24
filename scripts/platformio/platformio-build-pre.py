@@ -47,6 +47,7 @@ def ZephyrBuildProgram(env):
 
     # Force execution of offset header target before compiling project sources
     env.Depends(env["PIOBUILDFILES"], env["__ZEPHYR_OFFSET_HEADER_CMD"])
+    #env.Depends(env["PIOBUILDFILES"], env["__ZEPHYR_ZRS_CMD"])
 
     main_file_path = list(filter(lambda f: "main.c" in f,  os.listdir(env["PROJECT_SRC_DIR"])))[0]
     program = env.Program(
@@ -55,7 +56,6 @@ def ZephyrBuildProgram(env):
         env["_EXTRA_ZEPHYR_PIOBUILDFILES"],
         LDSCRIPT_PATH=os.path.join("$BUILD_DIR", "zephyr", "linker.cmd")
     )
-
     env.Depends(program_pre1, program_pre0)
     env.Depends(program, program_pre1)
 
@@ -70,7 +70,6 @@ def ZephyrBuildProgram(env):
     )
 
     print("Building in %s mode" % env.GetBuildType())
-
     return program
 
 env.AddMethod(ZephyrBuildProgram, "BuildProgram")
