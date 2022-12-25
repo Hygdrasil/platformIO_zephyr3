@@ -40,7 +40,7 @@ def ZephyrBuildProgram(env):
 
     program_pre1 = env.Program(
         os.path.join("$BUILD_DIR", "zephyr", "firmware-pre1"), 
-        env["PIOBUILDFILES"][2] +
+        env["PIOBUILDFILES"][2:] +
         env["PIOBUILDFILES"][1],
         LDSCRIPT_PATH=os.path.join("$BUILD_DIR", "zephyr", "linker_zephyr_pre1.cmd")
     )
@@ -51,7 +51,7 @@ def ZephyrBuildProgram(env):
     main_file_path = list(filter(lambda f: "main.c" in f,  os.listdir(env["PROJECT_SRC_DIR"])))[0]
     program = env.Program(
         os.path.join("$BUILD_DIR", env.subst("$PROGNAME")),
-        env["PIOBUILDFILES"][2] +
+        env["PIOBUILDFILES"][2:] +
         env["_EXTRA_ZEPHYR_PIOBUILDFILES"],
         LDSCRIPT_PATH=os.path.join("$BUILD_DIR", "zephyr", "linker.cmd")
     )
