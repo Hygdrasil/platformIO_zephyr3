@@ -873,30 +873,6 @@ def generate_sterror_table():
     )
     return builder
 
-def compile_offset_cmd():
-    builder = env.Object(
-        target = os.path.join(
-            "$BUILD_DIR",
-            "zephyr",
-            "CMakeFiles",
-            "offsets.dir",
-            "arch",
-            get_board_architecture(board),
-            "core",
-            "offsets",
-            "offsets.c.obj",
-        ), 
-
-        source= os.path.join(
-            FRAMEWORK_DIR,
-            "arch",
-            get_board_architecture(board),
-            "core",
-            "offsets",
-            "offsets.c")
-    )
-    return builder
-
 def generate_offset_header_file_cmd():
     cmd = [
         "$PYTHONEXE",
@@ -905,36 +881,20 @@ def generate_offset_header_file_cmd():
         "$SOURCE",
         "-o",
         "$TARGET",
-        #"&&",
-        #"cp",
-        #os.path.join(
-        #    BUILD_DIR,
-        #    "offsets",
-        #    "zephyr",
-        #    "arch",
-        #    get_board_architecture(board),
-        #    "core",
-        #    "offsets",
-        #    "offsets.c.o"),
-        #os.path.join(BUILD_DIR, *("zephyr/CMakeFiles/offsets.dir/./arch/arm/core/offsets/offsets.c.obj".split("/")))
-        #/home/kappy/Documents/PlatformIO/Projects/zephyrTest/.pio/build/nucleo/zephyr/CMakeFiles/offsets.dir/./arch/arm/core/offsets/offsets.c.obj
-        #   /home/kappy/Documents/PlatformIO/Projects/zephyrTest/.pio/build/nucleo/zephyr/CMakeFiles/offsets.dir/arch/arm/core/offsets/offsets.c.obj
-        #                                                                       zephyr/CMakeFiles/offsets.dir/./arch/arm/core/offsets/offsets.c.obj
-    ]
+     ]
 
     builder = env.Command(
         os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "offsets.h"),
-        #os.path.join(
-        #    "$BUILD_DIR",
-        #    "offsets",
-        #    "zephyr",
-        #    "arch",
-        #    get_board_architecture(board),
-        #    "core",
-        #    "offsets",
-        #    "offsets.c.o",
-        #),
-        os.path.join(BUILD_DIR, *("zephyr/CMakeFiles/offsets.dir/./arch/arm/core/offsets/offsets.c.obj".split("/"))),
+        os.path.join(
+            "$BUILD_DIR",
+            "offsets",
+            "zephyr",
+            "arch",
+            get_board_architecture(board),
+            "core",
+            "offsets",
+            "offsets.c.o",
+        ),
         env.VerboseAction(" ".join(cmd), "Generating header file with offsets $TARGET"),
     )
     return builder
@@ -1272,7 +1232,7 @@ def process_project_lib_deps(
                 for library in project_libs["generic_libs"]
             ]
             + project_libs["standard_libs"]
-        ),
+        )
     )
 
     # Note: These libraries are not added to the `LIBS` section. Hence they must be
@@ -1341,12 +1301,9 @@ project_settings = load_project_settings()
 #
 
 offset_header_file = generate_offset_header_file_cmd()
-offset_obj = compile_offset_cmd()
-env.Requires(offset_header_file, offset_obj)
 version_header_file = generate_version_header_file_cmd()
 syscalls_config = parse_syscalls()
 sys_calls = generate_syscall_files(syscalls_config, project_settings)
-env.Requires(offset_obj, sys_calls)
 generate_kobject_files()
 validate_driver()
 
@@ -1456,10 +1413,12 @@ for dep in (isr_table_file, final_ld_script):
     env.Depends("$PROG_PATH", dep)
 
 linker_arguments = extract_link_args(prebuilt_config_0)
-print(linker_arguments)
-linker_arguments['link_flags'][linker_arguments['link_flags'].index('zephyr/CMakeFiles/offsets.dir/./arch/arm/core/offsets/offsets.c.obj')] = ""
 
-#raise Exception()
+# remove the offsets.c.obj because it is not needed in zephr-v3.2
+for index, flag in enumerate(linker_arguments['link_flags']):
+    if flag.endswith('offsets.c.obj'):
+        linker_arguments['link_flags'].pop(index)
+        print(f'poped: {flag}')
 
 # remove the main linker script flags '-T linker.cmd'
 try:
@@ -1554,13 +1513,7 @@ env.Append(
             suffix=".hex",
         ),
     ),
-    CPPPATH = [os.path.join(FRAMEWORK_DIR, "include", "zephyr"), 
-        os.path.join(FRAMEWORK_DIR, "build", "zephyr", "include", "generated"),
-        os.path.join( FRAMEWORK_DIR, "kernel", "include"), 
-        os.path.join( FRAMEWORK_DIR, "include"), 
-        FRAMEWORK_DIR,
-        os.path.join( FRAMEWORK_DIR, 'arch', get_board_architecture(board), "include"),
-        os.path.join( BUILD_DIR, "zephyr","CMakeFiles")] #"gen_offset.h"
+    CPPPATH = [os.path.join(FRAMEWORK_DIR, "include", "zephyr"), ]
 
 )
 
