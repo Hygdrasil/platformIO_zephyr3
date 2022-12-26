@@ -873,6 +873,13 @@ def generate_sterror_table():
     )
     return builder
 
+def compile_offsets_c_obj():
+    return env.Object(
+        target = os.path.join(BUILD_DIR, *("zephyr/CMakeFiles/offsets.dir/arch/arm/core/offsets/offsets.c.o".split('/'))),
+        source = [os.path.join(FRAMEWORK_DIR, *("arch/arm/core/offsets/offsets.c".split('/')))],
+        #DEFINES = "-DKERNEL -D_FORTIFY_SOURCE=2 -D__PROGRAM_START -D__ZEPHYR__=1",
+    )
+
 def generate_offset_header_file_cmd():
     cmd = [
         "$PYTHONEXE",
@@ -887,14 +894,14 @@ def generate_offset_header_file_cmd():
         os.path.join("$BUILD_DIR", "zephyr", "include", "generated", "offsets.h"),
         os.path.join(
             "$BUILD_DIR",
-            "offsets",
             "zephyr",
+            "CMakeFiles",
+            "offsets.dir",
             "arch",
             get_board_architecture(board),
             "core",
             "offsets",
-            "offsets.c.o",
-        ),
+            "offsets.c.o"),
         env.VerboseAction(" ".join(cmd), "Generating header file with offsets $TARGET"),
     )
     return builder
@@ -1223,7 +1230,7 @@ def process_project_lib_deps(
         _LIBFLAGS=" -Wl,--whole-archive "
         + " ".join(
             [os.path.join("$BUILD_DIR", library) for library in whole_libs]
-            + [offsets_lib[0].get_abspath()]
+            
         )
         + " -Wl,--no-whole-archive "
         + " ".join(
@@ -1303,6 +1310,9 @@ project_settings = load_project_settings()
 offset_header_file = generate_offset_header_file_cmd()
 version_header_file = generate_version_header_file_cmd()
 syscalls_config = parse_syscalls()
+
+offset_obj = compile_offsets_c_obj()
+env.Depends(offset_header_file, offset_obj)
 sys_calls = generate_syscall_files(syscalls_config, project_settings)
 generate_kobject_files()
 validate_driver()
@@ -1375,8 +1385,6 @@ for target, target_config in target_configs.items():
     ):
         env.Depends(lib[0].sources, offset_header_file)
 
-# Offsets library compiled separately as it's used later for custom dependencies
-offsets_lib = build_library(env, target_configs["offsets"], PROJECT_SRC_DIR)
 sterror_table = generate_sterror_table()
 #
 # Preliminary elf and subsequent targets
@@ -1385,7 +1393,7 @@ sterror_table = generate_sterror_table()
 preliminary_elf_path = os.path.join("$BUILD_DIR", "zephyr", "firmware-pre0.elf")
 preliminary_elf_path_1 = os.path.join("$BUILD_DIR", "zephyr", "firmware-pre1.elf")
 
-for dep in (offsets_lib, preliminary_ld_script, preliminary_ld_script_1, version_header_file):
+for dep in (offset_obj, preliminary_ld_script, preliminary_ld_script_1, version_header_file): 
     env.Depends(preliminary_elf_path, dep)
 
 isr_table_file = generate_isr_table_file_cmd(
@@ -1406,7 +1414,7 @@ env.Append(
         compile_source_files(prebuilt_config_1, env, PROJECT_SRC_DIR)
     ],
     _EXTRA_ZEPHYR_PIOBUILDFILES=compile_source_files(target_configs["zephyr_final"], env, PROJECT_SRC_DIR),
-    __ZEPHYR_OFFSET_HEADER_CMD=offset_header_file,
+    __ZEPHYR_OFFSET_HEADER_CMD=offset_header_file
 )
 
 for dep in (isr_table_file, final_ld_script):
@@ -1417,7 +1425,16 @@ linker_arguments = extract_link_args(prebuilt_config_0)
 # remove the offsets.c.obj because it is not needed in zephr-v3.2
 for index, flag in enumerate(linker_arguments['link_flags']):
     if flag.endswith('offsets.c.obj'):
-        linker_arguments['link_flags'].pop(index)
+        linker_arguments['link_flags'][index] = os.path.join(
+            "$BUILD_DIR",
+            "zephyr",
+            "CMakeFiles",
+            "offsets.dir",
+            "arch",
+            get_board_architecture(board),
+            "core",
+            "offsets",
+            "offsets.c.o")
         print(f'poped: {flag}')
 
 # remove the main linker script flags '-T linker.cmd'
@@ -1446,7 +1463,7 @@ process_project_lib_deps(
     linker_arguments["project_libs"],
     preliminary_elf_path,
     preliminary_elf_path_1,
-    offsets_lib,
+    offset_obj, 
     linker_arguments["lib_paths"],
 )
 
@@ -1456,7 +1473,16 @@ process_project_lib_deps(
 
 env.Replace(ARFLAGS=["qc"])
 env.Append(
-    CPPPATH=app_includes["plain_includes"],
+    CPPPATH=[app_includes["plain_includes"],
+        os.path.join(FRAMEWORK_DIR, "include", "zephyr"), 
+        os.path.join(FRAMEWORK_DIR, "build", "zephyr", "include", "generated"),
+        os.path.join( FRAMEWORK_DIR, "kernel", "include"), 
+        os.path.join( FRAMEWORK_DIR, "include"), 
+        FRAMEWORK_DIR,
+        os.path.join( FRAMEWORK_DIR, 'arch', get_board_architecture(board), "include"),
+        os.path.join( BUILD_DIR, "zephyr","CMakeFiles"),
+        os.path.join( BUILD_DIR, "zephyr", "include", "generated"),
+    ],
     CCFLAGS=[("-isystem", inc) for inc in app_includes.get("sys_includes", [])],
     CPPDEFINES=get_app_defines(app_config),
     LINKFLAGS=linker_arguments["link_flags"],
