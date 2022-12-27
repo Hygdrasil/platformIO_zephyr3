@@ -205,6 +205,18 @@ def is_cmake_reconfigure_required():
 
     return False
 
+def get_kconfig_value(key : str):
+    config_path = os.path.join(BUILD_DIR, "zephyr", "misc", "generated", "configs.c")
+    with open(config_path) as config:
+        for line in config.readlines():
+            if key in line:
+                line = line.replace("\n", "")
+                line = line.replace("GEN_ABSOLUTE_SYM_KCONFIG(", "")
+                line = line.replace(");", "")
+                line = line.strip()
+                return line.split(', ')
+    return ["", ""]
+
 
 def run_cmake(manifest):
     print("Reading CMake configuration...")
@@ -361,6 +373,41 @@ def _fix_package_path(module_path):
     assert module_path and os.path.isdir(module_path)
     return module_path
 
+def compile_bootloader():
+    bootloader_offsets = os.path.join(BUILD_DIR, *("bootloader/boot_stage2.S".split("/")))
+    #only this single file is needed to compile the hole aplication.
+    if not os.path.exists(bootloader_offsets):
+        compiler = os.path.join(platform.get_package_dir("toolchain-gccarmnoneeabi"),"bin", "arm-none-eabi-gcc")
+        pico_hal = os.path.join(FRAMEWORK_DIR, "_pio", "modules", "hal", "rpi_pico")
+        bootloader_source_dir = os.path.join(FRAMEWORK_DIR, "modules", "hal_rpi_pico", "bootloader")
+        flash_config_name = get_kconfig_value("CONFIG_RP2_FLASH_")[0]
+        flash_type = flash_config_name.replace("CONFIG_RP2_FLASH_", "")
+        cmake_path =  os.path.join(platform.get_package_dir("tool-cmake") or "", "bin", "cmake")
+        cmd = [
+            cmake_path,
+            "-DCMAKE_SYSTEM_NAME=Generic",
+            f'-DCMAKE_C_COMPILER={compiler}',
+            f'-DCMAKE_ASM_COMPILER={compiler}',
+            f'-DZEPHYR_HAL_RPI_PICO_MODULE_DIR={pico_hal}',
+            f'-DZEPHYR_BASE={FRAMEWORK_DIR}',
+            f'-DFLASH_TYPE={flash_type}',
+            f'-DPYTHON_EXECUTABLE={env.subst("$PYTHONEXE")}',
+            f'-DCONFIG_LEGACY_INCLUDE_PATH=0',
+            f'-DRP2_BOOTLOADER_BYPRODUCT={bootloader_offsets}',
+            f'-GNinja',
+            bootloader_source_dir,
+            "&&",
+            cmake_path,
+            "-E",
+            "touch",
+            os.path.join(BUILD_DIR, *("modules/hal_rpi_pico/second_stage_bootloader-prefix/src/second_stage_bootloader-stamp/second_stage_bootloader-configure".split('/'))),
+            "&&",
+            cmake_path, 
+            "--build",
+            "."
+        ]
+
+        Execute(" ".join(cmd))
 
 def generate_includible_file(source_file):
     cmd = [
@@ -1262,38 +1309,6 @@ def process_project_lib_deps(
         ],
     )
 
-def handle_bootloader():
-    rasberry_boot_asm = """
-// Padded and checksummed version of: boot_stage2.bin
-
-.cpu cortex-m0plus
-.thumb
-
-.section .boot2, "ax"
-
-.byte 0x00, 0xb5, 0x32, 0x4b, 0x21, 0x20, 0x58, 0x60, 0x98, 0x68, 0x02, 0x21, 0x88, 0x43, 0x98, 0x60
-.byte 0xd8, 0x60, 0x18, 0x61, 0x58, 0x61, 0x2e, 0x4b, 0x00, 0x21, 0x99, 0x60, 0x04, 0x21, 0x59, 0x61
-.byte 0x01, 0x21, 0xf0, 0x22, 0x99, 0x50, 0x2b, 0x49, 0x19, 0x60, 0x01, 0x21, 0x99, 0x60, 0x35, 0x20
-.byte 0x00, 0xf0, 0x44, 0xf8, 0x02, 0x22, 0x90, 0x42, 0x14, 0xd0, 0x06, 0x21, 0x19, 0x66, 0x00, 0xf0
-.byte 0x34, 0xf8, 0x19, 0x6e, 0x01, 0x21, 0x19, 0x66, 0x00, 0x20, 0x18, 0x66, 0x1a, 0x66, 0x00, 0xf0
-.byte 0x2c, 0xf8, 0x19, 0x6e, 0x19, 0x6e, 0x19, 0x6e, 0x05, 0x20, 0x00, 0xf0, 0x2f, 0xf8, 0x01, 0x21
-.byte 0x08, 0x42, 0xf9, 0xd1, 0x00, 0x21, 0x99, 0x60, 0x1b, 0x49, 0x19, 0x60, 0x00, 0x21, 0x59, 0x60
-.byte 0x1a, 0x49, 0x1b, 0x48, 0x01, 0x60, 0x01, 0x21, 0x99, 0x60, 0xeb, 0x21, 0x19, 0x66, 0xa0, 0x21
-.byte 0x19, 0x66, 0x00, 0xf0, 0x12, 0xf8, 0x00, 0x21, 0x99, 0x60, 0x16, 0x49, 0x14, 0x48, 0x01, 0x60
-.byte 0x01, 0x21, 0x99, 0x60, 0x01, 0xbc, 0x00, 0x28, 0x00, 0xd0, 0x00, 0x47, 0x12, 0x48, 0x13, 0x49
-.byte 0x08, 0x60, 0x03, 0xc8, 0x80, 0xf3, 0x08, 0x88, 0x08, 0x47, 0x03, 0xb5, 0x99, 0x6a, 0x04, 0x20
-.byte 0x01, 0x42, 0xfb, 0xd0, 0x01, 0x20, 0x01, 0x42, 0xf8, 0xd1, 0x03, 0xbd, 0x02, 0xb5, 0x18, 0x66
-.byte 0x18, 0x66, 0xff, 0xf7, 0xf2, 0xff, 0x18, 0x6e, 0x18, 0x6e, 0x02, 0xbd, 0x00, 0x00, 0x02, 0x40
-.byte 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x07, 0x00, 0x00, 0x03, 0x5f, 0x00, 0x21, 0x22, 0x00, 0x00
-.byte 0xf4, 0x00, 0x00, 0x18, 0x22, 0x20, 0x00, 0xa0, 0x00, 0x01, 0x00, 0x10, 0x08, 0xed, 0x00, 0xe0
-.byte 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x0b, 0x8f, 0xd5
-"""
-    if "raspberrypi" in env.subst("$PIOPLATFORM"):
-        build_asm = os.path.join(BUILD_DIR, "bootloader", "boot_stage2.S")
-        if not os.path.isfile(build_asm):
-            with open(build_asm, "w") as fp:
-                fp.write(rasberry_boot_asm)
-            
 #
 # Current build script limitations
 #
@@ -1342,12 +1357,15 @@ offset_header_file = generate_offset_header_file_cmd()
 version_header_file = generate_version_header_file_cmd()
 syscalls_config = parse_syscalls()
 
+#the raspberry pi pico depends on a file generated in the compileprocess of the bootloader
+if "raspberrypi" == env.subst("$PIOPLATFORM"):
+    compile_bootloader()
+    
 offset_obj = compile_offsets_c_obj()
 env.Depends(offset_header_file, offset_obj)
 sys_calls = generate_syscall_files(syscalls_config, project_settings)
 generate_kobject_files()
 validate_driver()
-handle_bootloader()
 
 #
 # LD scripts processing
@@ -1467,7 +1485,6 @@ for index, flag in enumerate(linker_arguments['link_flags']):
             "core",
             "offsets",
             "offsets.c.o")
-        print(f'poped: {flag}')
 
 # remove the main linker script flags '-T linker.cmd'
 try:
