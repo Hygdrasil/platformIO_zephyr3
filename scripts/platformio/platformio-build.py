@@ -883,7 +883,6 @@ def generate_version_header_file_cmd():
         "-DZEPHYR_BASE=%s" % FRAMEWORK_DIR,
         "-DOUT_FILE='%s'" % os.path.join(
             "$BUILD_DIR", "zephyr", "include", "generated", "version.h"),
-        "-DBUILD_VERSION=%s" % ("zephyr-v" + FRAMEWORK_VERSION.split(".")[1]),
         "-P",
         os.path.join(FRAMEWORK_DIR, "cmake", "gen_version_h.cmake")
     ]
@@ -1407,8 +1406,6 @@ if "build.embed_files" in board:
 #
 # Libraries processing
 #
-
-env.Append(CPPDEFINES=[("BUILD_VERSION", "zephyr-v" + FRAMEWORK_VERSION.split(".")[1])])
 
 framework_modules_map = {}
 for target, target_config in target_configs.items():
