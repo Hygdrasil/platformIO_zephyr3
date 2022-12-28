@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 zephyr_get(ESPRESSIF_TOOLCHAIN_PATH)
+message(ESPRESSIF_TOOLCHAIN_PATH="${ESPRESSIF_TOOLCHAIN_PATH}")
 set_ifndef(ESPRESSIF_TOOLCHAIN_PATH "$ENV{ESPRESSIF_TOOLCHAIN_PATH}"  CACHE PATH "")
 assert(    ESPRESSIF_TOOLCHAIN_PATH "ESPRESSIF_TOOLCHAIN_PATH is not set")
 set(TOOLCHAIN_HOME ${ESPRESSIF_TOOLCHAIN_PATH})
 
 set(COMPILER gcc)
+set(CC gcc)
 set(LINKER ld)
 set(BINTOOLS gnu)
 
@@ -38,9 +40,13 @@ if(toolchain_paths)
 
   if(ESPRESSIF_DEPRECATED_PATH)
     if(DEFINED ENV{ESPRESSIF_TOOLCHAIN_BIN_PATH})
+      message(hello)
+      set( CMAKE_CXX_COMPILER $ENV{CMAKE_CXX_COMPILER})
+      set( CMAKE_C_COMPILER $ENV{CMAKE_C_COMPILER})
+      set( ZEPHYR_HAL_ESPRESSIF_MODULE_DIR  $ENV{ESP_IDF_PATH})
+      set(ESP_IDF_PATH $ENV{ESP_IDF_PATH})
       set_ifndef(ESPRESSIF_TOOLCHAIN_BIN_PATH $ENV{ESPRESSIF_TOOLCHAIN_BIN_PATH})
     else()
-      message("fuck")
       set_ifndef(ESPRESSIF_TOOLCHAIN_BIN_PATH ${CROSS_COMPILE_TARGET})
     endif()
     message(ESPRESSIF_TOOLCHAIN_BIN_PATH="${ESPRESSIF_TOOLCHAIN_BIN_PATH}")
@@ -50,8 +56,9 @@ if(toolchain_paths)
     set(CROSS_COMPILE ${one_toolchain_root}/bin/${CROSS_COMPILE_TARGET}-)
     set(SYSROOT_DIR   ${one_toolchain_root}/${SYSROOT_TARGET})
   endif()
-
+  message(ESP_IDF_PATH="${ESP_IDF_PATH}")
 endif()
+message(CROSS_COMPILE="${CROSS_COMPILE}")
 
 if(NOT CROSS_COMPILE_TARGET)
   message(FATAL_ERROR
